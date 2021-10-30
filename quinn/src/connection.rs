@@ -24,7 +24,7 @@ use crate::{
     poll_fn,
     recv_stream::RecvStream,
     send_stream::{SendStream, WriteError},
-    ConnectionEvent, EndpointEvent, VarInt,
+    EndpointEvent, VarInt,
 };
 use proto::congestion::Controller;
 
@@ -42,17 +42,15 @@ impl Connecting {
         handle: ConnectionHandle,
         conn: proto::Connection,
         endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
-        conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
         udp_state: Arc<UdpState>,
         runtime: Arc<Box<dyn Runtime>>,
-    ) -> Connecting {
+    ) -> (Connecting, ConnectionRef) {
         let (on_handshake_data_send, on_handshake_data_recv) = oneshot::channel();
         let (on_connected_send, on_connected_recv) = oneshot::channel();
         let conn = ConnectionRef::new(
             handle,
             conn,
             endpoint_events,
-            conn_events,
             on_handshake_data_send,
             on_connected_send,
             udp_state,
@@ -60,12 +58,14 @@ impl Connecting {
         );
 
         runtime.spawn(Box::pin(ConnectionDriver(conn.clone())));
-
-        Connecting {
-            conn: Some(conn),
-            connected: on_connected_recv,
-            handshake_data_ready: Some(on_handshake_data_recv),
-        }
+        (
+            Connecting {
+                conn: Some(conn.clone()),
+                connected: on_connected_recv,
+                handshake_data_ready: Some(on_handshake_data_recv),
+            },
+            conn,
+        )
     }
 
     /// Convert into a 0-RTT or 0.5-RTT connection at the cost of weakened security
@@ -278,10 +278,6 @@ impl Future for ConnectionDriver {
         let span = debug_span!("drive", id = conn.handle.0);
         let _guard = span.enter();
 
-        if let Err(e) = conn.process_conn_events(cx) {
-            conn.terminate(e);
-            return Poll::Ready(());
-        }
         let mut keep_going = conn.drive_transmit();
         // If a timer expires, there might be more to transmit. When we transmit something, we
         // might need to reset a timer. Hence, we must loop until neither happens.
@@ -724,7 +720,6 @@ impl ConnectionRef {
         handle: ConnectionHandle,
         conn: proto::Connection,
         endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
-        conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
         on_handshake_data: oneshot::Sender<()>,
         on_connected: oneshot::Sender<bool>,
         udp_state: Arc<UdpState>,
@@ -739,7 +734,6 @@ impl ConnectionRef {
             connected: false,
             timer: None,
             timer_deadline: None,
-            conn_events,
             endpoint_events,
             blocked_writers: FxHashMap::default(),
             blocked_readers: FxHashMap::default(),
@@ -801,7 +795,6 @@ pub struct ConnectionInner {
     connected: bool,
     timer: Option<Pin<Box<dyn AsyncTimer>>>,
     timer_deadline: Option<Instant>,
-    conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
     endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
     pub(crate) blocked_writers: FxHashMap<StreamId, Waker>,
     pub(crate) blocked_readers: FxHashMap<StreamId, Waker>,
@@ -855,33 +848,6 @@ impl ConnectionInner {
             let _ = self
                 .endpoint_events
                 .send((self.handle, EndpointEvent::Proto(event)));
-        }
-    }
-
-    /// If this returns `Err`, the endpoint is dead, so the driver should exit immediately.
-    fn process_conn_events(&mut self, cx: &mut Context) -> Result<(), ConnectionError> {
-        loop {
-            match self.conn_events.poll_recv(cx) {
-                Poll::Ready(Some(ConnectionEvent::Ping)) => {
-                    self.inner.ping();
-                }
-                Poll::Ready(Some(ConnectionEvent::Proto(event))) => {
-                    self.inner.handle_event(event);
-                }
-                Poll::Ready(Some(ConnectionEvent::Close { reason, error_code })) => {
-                    self.close(error_code, reason);
-                }
-                Poll::Ready(None) => {
-                    return Err(ConnectionError::TransportError(proto::TransportError {
-                        code: proto::TransportErrorCode::INTERNAL_ERROR,
-                        frame: None,
-                        reason: "endpoint driver future was dropped".to_string(),
-                    }));
-                }
-                Poll::Pending => {
-                    return Ok(());
-                }
-            }
         }
     }
 
@@ -1045,7 +1011,7 @@ impl ConnectionInner {
         self.closed.notify_waiters();
     }
 
-    fn close(&mut self, error_code: VarInt, reason: Bytes) {
+    pub fn close(&mut self, error_code: VarInt, reason: Bytes) {
         self.inner.close(Instant::now(), error_code, reason);
         self.terminate(ConnectionError::LocallyClosed);
         self.wake();
