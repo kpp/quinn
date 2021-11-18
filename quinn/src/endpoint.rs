@@ -408,7 +408,7 @@ impl Drop for EndpointDriver {
 #[derive(Debug)]
 pub(crate) struct EndpointInner {
     socket: Box<dyn AsyncUdpSocket>,
-    udp_state: Arc<UdpState>,
+    udp_state: UdpState,
     inner: proto::Endpoint,
     outgoing: VecDeque<proto::Transmit>,
     incoming: VecDeque<Connecting>,
@@ -629,7 +629,7 @@ pub(crate) struct EndpointRef(Arc<Mutex<EndpointInner>>);
 
 impl EndpointRef {
     pub(crate) fn new(socket: Box<dyn AsyncUdpSocket>, inner: proto::Endpoint, ipv6: bool) -> Self {
-        let udp_state = Arc::new(UdpState::new());
+        let udp_state = UdpState::new();
         let recv_buf = vec![
             0;
             inner.config().get_max_udp_payload_size().min(64 * 1024) as usize
