@@ -46,6 +46,7 @@ tracing = "0.1.10"
 tokio = { version = "1.0.1", features = ["sync"] }
 udp = { package = "quinn-udp", path = "../quinn-udp", version = "0.2" }
 webpki = { version = "0.22", default-features = false, optional = true }
+slab = "0.4"
 
 [dev-dependencies]
 anyhow = "1.0.22"
