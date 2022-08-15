@@ -39,7 +39,7 @@ use crate::{
 pub struct Endpoint {
     pub(crate) inner: EndpointRef,
     pub(crate) default_client_config: Option<ClientConfig>,
-    runtime: Arc<Box<dyn Runtime>>,
+    runtime: Arc<dyn Runtime>,
 }
 
 impl Endpoint {
@@ -94,7 +94,7 @@ impl Endpoint {
         runtime: impl Runtime,
     ) -> io::Result<(Self, Incoming)> {
         let socket = runtime.wrap_udp_socket(socket)?;
-        Self::new_with_runtime(config, server_config, socket, Box::new(runtime))
+        Self::new_with_runtime(config, server_config, socket, Arc::new(runtime))
     }
 
     /// Construct an endpoint with arbitrary configuration and pre-constructed abstract socket
@@ -107,16 +107,15 @@ impl Endpoint {
         socket: impl AsyncUdpSocket,
         runtime: impl Runtime,
     ) -> io::Result<(Self, Incoming)> {
-        Self::new_with_runtime(config, server_config, Box::new(socket), Box::new(runtime))
+        Self::new_with_runtime(config, server_config, Box::new(socket), Arc::new(runtime))
     }
 
     fn new_with_runtime(
         config: EndpointConfig,
         server_config: Option<ServerConfig>,
         socket: Box<dyn AsyncUdpSocket>,
-        runtime: Box<dyn Runtime>,
+        runtime: Arc<dyn Runtime>,
     ) -> io::Result<(Self, Incoming)> {
-        let runtime = Arc::new(runtime);
         let addr = socket.local_addr()?;
         let rc = EndpointRef::new(
             socket,
