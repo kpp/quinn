@@ -21,6 +21,8 @@ use udp::UdpState;
 
 use crate::{
     mutex::Mutex,
+    notify,
+    notify::NotifyOwned,
     poll_fn,
     recv_stream::RecvStream,
     send_stream::{SendStream, WriteError},
@@ -324,9 +326,11 @@ impl Connection {
     /// Streams are cheap and instantaneous to open unless blocked by flow control. As a
     /// consequence, the peer won't be notified that a stream has been opened until the stream is
     /// actually used.
-    pub async fn open_uni(&self) -> Result<SendStream, ConnectionError> {
-        let (id, is_0rtt) = self.open(Dir::Uni).await?;
-        Ok(SendStream::new(self.0.clone(), id, is_0rtt))
+    pub fn open_uni(&self) -> OpenUni {
+        OpenUni {
+            conn: Some(self.0.clone()),
+            notify: self.0.lock("open_uni").stream_opening[Dir::Uni as usize].wait(),
+        }
     }
 
     /// Initiate a new outgoing bidirectional stream.
@@ -334,35 +338,34 @@ impl Connection {
     /// Streams are cheap and instantaneous to open unless blocked by flow control. As a
     /// consequence, the peer won't be notified that a stream has been opened until the stream is
     /// actually used.
-    pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), ConnectionError> {
-        let (id, is_0rtt) = self.open(Dir::Bi).await?;
-        Ok((
-            SendStream::new(self.0.clone(), id, is_0rtt),
-            RecvStream::new(self.0.clone(), id, is_0rtt),
-        ))
+    pub fn open_bi(&self) -> OpenBi {
+        OpenBi {
+            conn: Some(self.0.clone()),
+            notify: self.0.lock("open_bi").stream_opening[Dir::Bi as usize].wait(),
+        }
     }
 
-    async fn open(&self, dir: Dir) -> Result<(StreamId, bool), ConnectionError> {
-        loop {
-            let opening;
-            {
-                let mut conn = self.0.lock("open");
-                if let Some(ref e) = conn.error {
-                    return Err(e.clone());
-                }
-                if let Some(id) = conn.inner.streams().open(dir) {
-                    let is_0rtt = conn.inner.side().is_client() && conn.inner.is_handshaking();
-                    return Ok((id, is_0rtt));
-                }
-                // Clone the `Arc<Notify>` so we can wait on the underlying `Notify` without holding
-                // the lock. Store it in the outer scope to ensure it outlives the lock guard.
-                opening = conn.stream_opening[dir as usize].clone();
-                // Construct the future while the lock is held to ensure we can't miss a wakeup if
-                // the `Notify` is signaled immediately after we release the lock. `await` it after
-                // the lock guard is out of scope.
-                opening.notified()
-            }
-            .await
+    /// Accept the next incoming uni-directional stream
+    pub fn accept_uni(&self) -> AcceptUni {
+        AcceptUni {
+            conn: Some(self.0.clone()),
+            notify: self.0.lock("accept_uni").stream_incoming[Dir::Uni as usize].wait(),
+        }
+    }
+
+    /// Accept the next incoming bidirectional stream
+    pub fn accept_bi(&self) -> AcceptBi {
+        AcceptBi {
+            conn: Some(self.0.clone()),
+            notify: self.0.lock("accept_bi").stream_incoming[Dir::Bi as usize].wait(),
+        }
+    }
+
+    /// Receive an application datagram
+    pub fn read_datagram(&self) -> ReadDatagram {
+        ReadDatagram {
+            conn: self.0.clone(),
+            notify: self.0.lock("read_datagram").datagrams.wait(),
         }
     }
 
@@ -597,6 +600,63 @@ impl Clone for Connection {
     }
 }
 
+/// Future produced by [`Connection::open_uni`]
+pub struct OpenUni {
+    conn: Option<ConnectionRef>,
+    notify: notify::Waiter,
+}
+
+impl Future for OpenUni {
+    type Output = Result<SendStream, ConnectionError>;
+    fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        let (conn, id, is_0rtt) =
+            ready!(poll_open(ctx, &mut this.conn, &mut this.notify, Dir::Uni))?;
+        Poll::Ready(Ok(SendStream::new(conn, id, is_0rtt)))
+    }
+}
+
+/// Future produced by [`Connection::open_bi`]
+pub struct OpenBi {
+    conn: Option<ConnectionRef>,
+    notify: notify::Waiter,
+}
+
+impl Future for OpenBi {
+    type Output = Result<(SendStream, RecvStream), ConnectionError>;
+    fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        let (conn, id, is_0rtt) =
+            ready!(poll_open(ctx, &mut this.conn, &mut this.notify, Dir::Bi))?;
+
+        Poll::Ready(Ok((
+            SendStream::new(conn.clone(), id, is_0rtt),
+            RecvStream::new(conn, id, is_0rtt),
+        )))
+    }
+}
+
+fn poll_open(
+    ctx: &mut Context<'_>,
+    conn_storage: &mut Option<ConnectionRef>,
+    notify: &mut notify::Waiter,
+    dir: Dir,
+) -> Poll<Result<(ConnectionRef, StreamId, bool), ConnectionError>> {
+    let mut conn = conn_storage.as_ref().unwrap().lock("poll_open");
+    if let Some(ref e) = conn.error {
+        Poll::Ready(Err(e.clone()))
+    } else if let Some(id) = conn.inner.streams().open(dir) {
+        let is_0rtt = conn.inner.side().is_client() && conn.inner.is_handshaking();
+        drop(conn); // Release the borrow so it can be passed to `RecvStream`
+        let conn = conn_storage.take().expect("polled after completion");
+        Poll::Ready(Ok((conn, id, is_0rtt)))
+    } else {
+        // `conn` lock ensures we don't race with readiness
+        notify.register(ctx);
+        Poll::Pending
+    }
+}
+
 /// A stream of unidirectional QUIC streams initiated by a remote peer.
 ///
 /// Incoming streams are *always* opened in the same order that the peer created them, but data can
@@ -687,6 +747,86 @@ impl futures_core::Stream for IncomingBiStreams {
     }
 }
 
+/// Future produced by [`Connection::accept_uni`]
+pub struct AcceptUni {
+    conn: Option<ConnectionRef>,
+    notify: notify::Waiter,
+}
+
+impl Future for AcceptUni {
+    type Output = Result<RecvStream, ConnectionError>;
+    fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        let (conn, id, is_0rtt) =
+            ready!(poll_accept(ctx, &mut this.conn, &mut this.notify, Dir::Uni))?;
+        Poll::Ready(Ok(RecvStream::new(conn, id, is_0rtt)))
+    }
+}
+
+/// Future produced by [`Connection::accept_bi`]
+pub struct AcceptBi {
+    conn: Option<ConnectionRef>,
+    notify: notify::Waiter,
+}
+
+impl Future for AcceptBi {
+    type Output = Result<(SendStream, RecvStream), ConnectionError>;
+    fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        let (conn, id, is_0rtt) =
+            ready!(poll_accept(ctx, &mut this.conn, &mut this.notify, Dir::Bi))?;
+        Poll::Ready(Ok((
+            SendStream::new(conn.clone(), id, is_0rtt),
+            RecvStream::new(conn, id, is_0rtt),
+        )))
+    }
+}
+
+fn poll_accept(
+    ctx: &mut Context<'_>,
+    conn_storage: &mut Option<ConnectionRef>,
+    notify: &mut notify::Waiter,
+    dir: Dir,
+) -> Poll<Result<(ConnectionRef, StreamId, bool), ConnectionError>> {
+    let mut conn = conn_storage.as_ref().unwrap().lock("poll_accept");
+    if let Some(id) = conn.inner.streams().accept(dir) {
+        let is_0rtt = conn.inner.is_handshaking();
+        conn.wake(); // To send additional stream ID credit
+        drop(conn); // Release the borrow so it can be passed to `RecvStream`
+        let conn = conn_storage.take().expect("polled after completion");
+        Poll::Ready(Ok((conn, id, is_0rtt)))
+    } else if let Some(ref e) = conn.error {
+        Poll::Ready(Err(e.clone()))
+    } else {
+        // `conn` lock ensures we don't race with readiness
+        notify.register(ctx);
+        Poll::Pending
+    }
+}
+
+/// Future produced by [`Connection::read_datagram`]
+pub struct ReadDatagram {
+    conn: ConnectionRef,
+    notify: notify::Waiter,
+}
+
+impl Future for ReadDatagram {
+    type Output = Result<Bytes, ConnectionError>;
+    fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        let mut conn = this.conn.lock("ReadDatagram::poll");
+        if let Some(x) = conn.inner.datagrams().recv() {
+            Poll::Ready(Ok(x))
+        } else if let Some(ref e) = conn.error {
+            Poll::Ready(Err(e.clone()))
+        } else {
+            // `conn` lock ensures we don't race with readiness
+            this.notify.register(ctx);
+            Poll::Pending
+        }
+    }
+}
+
 /// Stream of unordered, unreliable datagrams sent by the peer
 #[derive(Debug)]
 pub struct Datagrams(ConnectionRef);
@@ -749,10 +889,12 @@ impl ConnectionRef {
             endpoint_events,
             blocked_writers: FxHashMap::default(),
             blocked_readers: FxHashMap::default(),
-            stream_opening: [Arc::new(Notify::new()), Arc::new(Notify::new())],
+            stream_opening: [NotifyOwned::new(), NotifyOwned::new()],
             incoming_uni_streams_reader: None,
+            stream_incoming: [NotifyOwned::new(), NotifyOwned::new()],
             incoming_bi_streams_reader: None,
             datagram_reader: None,
+            datagrams: NotifyOwned::new(),
             finishing: FxHashMap::default(),
             stopped: FxHashMap::default(),
             closed: Arc::new(Notify::new()),
@@ -811,10 +953,12 @@ pub struct ConnectionInner {
     endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
     pub(crate) blocked_writers: FxHashMap<StreamId, Waker>,
     pub(crate) blocked_readers: FxHashMap<StreamId, Waker>,
-    stream_opening: [Arc<Notify>; 2],
+    stream_opening: [NotifyOwned; 2],
     incoming_uni_streams_reader: Option<Waker>,
     incoming_bi_streams_reader: Option<Waker>,
+    stream_incoming: [NotifyOwned; 2],
     datagram_reader: Option<Waker>,
+    datagrams: NotifyOwned,
     pub(crate) finishing: FxHashMap<StreamId, oneshot::Sender<Option<WriteError>>>,
     pub(crate) stopped: FxHashMap<StreamId, Waker>,
     closed: Arc<Notify>,
@@ -916,16 +1060,19 @@ impl ConnectionInner {
                     }
                 }
                 Stream(StreamEvent::Opened { dir: Dir::Uni }) => {
+                    self.stream_incoming[Dir::Uni as usize].notify_all();
                     if let Some(x) = self.incoming_uni_streams_reader.take() {
                         x.wake();
                     }
                 }
                 Stream(StreamEvent::Opened { dir: Dir::Bi }) => {
+                    self.stream_incoming[Dir::Bi as usize].notify_all();
                     if let Some(x) = self.incoming_bi_streams_reader.take() {
                         x.wake();
                     }
                 }
                 DatagramReceived => {
+                    self.datagrams.notify_all();
                     if let Some(x) = self.datagram_reader.take() {
                         x.wake();
                     }
@@ -936,7 +1083,7 @@ impl ConnectionInner {
                     }
                 }
                 Stream(StreamEvent::Available { dir }) => {
-                    self.stream_opening[dir as usize].notify_one();
+                    self.stream_opening[dir as usize].notify_all();
                 }
                 Stream(StreamEvent::Finished { id }) => {
                     if let Some(finishing) = self.finishing.remove(&id) {
@@ -1028,14 +1175,17 @@ impl ConnectionInner {
         for (_, reader) in self.blocked_readers.drain() {
             reader.wake()
         }
-        self.stream_opening[Dir::Uni as usize].notify_waiters();
-        self.stream_opening[Dir::Bi as usize].notify_waiters();
+        self.stream_opening[Dir::Uni as usize].notify_all();
+        self.stream_opening[Dir::Bi as usize].notify_all();
+        self.stream_incoming[Dir::Uni as usize].notify_all();
+        self.stream_incoming[Dir::Bi as usize].notify_all();
         if let Some(x) = self.incoming_uni_streams_reader.take() {
             x.wake();
         }
         if let Some(x) = self.incoming_bi_streams_reader.take() {
             x.wake();
         }
+        self.datagrams.notify_all();
         if let Some(x) = self.datagram_reader.take() {
             x.wake();
         }
