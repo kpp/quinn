@@ -15,14 +15,11 @@ use bytes::Bytes;
 use proto::{ConnectionError, ConnectionHandle, ConnectionStats, Dir, StreamEvent, StreamId};
 use rustc_hash::FxHashMap;
 use thiserror::Error;
-use tokio::{
-    sync::{mpsc, oneshot, Notify},
-    time::Instant as TokioInstant,
-};
-use tokio_util::time::delay_queue;
+use tokio::sync::{mpsc, oneshot, Notify};
 use tracing::debug_span;
 
 use crate::{
+    delay_queue::Timer,
     mutex::Mutex,
     poll_fn,
     recv_stream::RecvStream,
@@ -750,8 +747,8 @@ pub struct ConnectionInner {
     on_handshake_data: Option<oneshot::Sender<()>>,
     on_connected: Option<oneshot::Sender<bool>>,
     connected: bool,
-    pub(crate) timer_handle: Option<delay_queue::Key>,
-    pub(crate) timer_deadline: Option<TokioInstant>,
+    pub(crate) timer_handle: Option<Timer>,
+    pub(crate) timer_deadline: Option<Instant>,
     pub(crate) blocked_writers: FxHashMap<StreamId, Waker>,
     pub(crate) blocked_readers: FxHashMap<StreamId, Waker>,
     stream_opening: [Arc<Notify>; 2],

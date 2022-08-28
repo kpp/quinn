@@ -44,9 +44,9 @@ rustls = { version = "0.20.3", default-features = false, features = ["quic"], op
 thiserror = "1.0.21"
 tracing = "0.1.10"
 tokio = { version = "1.0.1", features = ["sync"] }
-tokio-util = { version = "0.6.9", features = ["time"] }
 udp = { package = "quinn-udp", path = "../quinn-udp", version = "0.2" }
 webpki = { version = "0.22", default-features = false, optional = true }
+slab = "0.4"
 
 [dev-dependencies]
 anyhow = "1.0.22"
@@ -61,6 +61,8 @@ tokio = { version = "1.0.1", features = ["rt", "rt-multi-thread", "time", "macro
 tracing-subscriber = { version = "0.3.0", default-features = false, features = ["env-filter", "fmt", "ansi", "time", "local-time"] }
 tracing-futures = { version = "0.2.0", default-features = false, features = ["std-future"] }
 url = "2"
+proptest = "1"
+rand_distr = "0.4"
 
 [[example]]
 name = "server"

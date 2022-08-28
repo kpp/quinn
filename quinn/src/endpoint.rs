@@ -12,18 +12,18 @@ use std::{
     time::Instant,
 };
 
-use crate::runtime::{default_runtime, AsyncUdpSocket, Runtime};
+use crate::runtime::{default_runtime, AsyncTimer, AsyncUdpSocket, Runtime};
 use bytes::{Bytes, BytesMut};
 use proto::{
     self as proto, ClientConfig, ConnectError, ConnectionHandle, DatagramEvent, ServerConfig,
 };
 use rustc_hash::FxHashMap;
 use tokio::sync::{mpsc, Notify};
-use tokio_util::time::DelayQueue;
 use udp::{RecvMeta, UdpState, BATCH_SIZE};
 
 use crate::{
     connection::{Connecting, ConnectionRef},
+    delay_queue::DelayQueue,
     poll_fn,
     work_limiter::WorkLimiter,
     EndpointConfig, VarInt, RECV_TIME_BOUND, SEND_TIME_BOUND,
@@ -118,6 +118,7 @@ impl Endpoint {
     ) -> io::Result<(Self, Incoming)> {
         let addr = socket.local_addr()?;
         let rc = EndpointRef::new(
+            runtime.clone(),
             socket,
             proto::Endpoint::new(Arc::new(config), server_config.map(Arc::new)),
             addr.is_ipv6(),
@@ -305,8 +306,10 @@ impl Future for EndpointDriver {
 
         let mut keep_going = endpoint.drive_recv(cx, Instant::now())?;
 
-        while let Poll::Ready(Some(result)) = endpoint.timers.poll_expired(cx) {
-            let conn_handle = result.unwrap().into_inner();
+        while let Some(conn_handle) = endpoint
+            .timers
+            .poll((Instant::now() - endpoint.timer_epoch).as_millis() as u64)
+        {
             let conn = match endpoint.connections.connections.get(&conn_handle) {
                 Some(c) => c,
                 None => continue,
@@ -317,6 +320,21 @@ impl Future for EndpointDriver {
             conn.timer_handle = None;
             conn.timer_deadline = None;
             conn.wake();
+        }
+        if let Some(deadline) = endpoint.timers.next_timeout() {
+            let deadline = endpoint.timer_epoch + std::time::Duration::from_millis(deadline);
+            let timer = match endpoint.base_timer {
+                Some(ref mut x) => {
+                    x.as_mut().reset(deadline);
+                    x
+                }
+                None => endpoint
+                    .base_timer
+                    .insert(endpoint.runtime.new_timer(deadline)),
+            };
+            if let Poll::Ready(()) = timer.as_mut().poll(cx) {
+                keep_going = true;
+            }
         }
 
         let mut dirty = Vec::new();
@@ -336,16 +354,17 @@ impl Future for EndpointDriver {
             let _guard = conn.span.clone().entered();
             let mut keep_conn_going = conn.drive_transmit(max_datagrams, &mut endpoint.outgoing);
             if let Some(deadline) = conn.inner.poll_timeout() {
-                let deadline = tokio::time::Instant::from(deadline);
                 if Some(deadline) != conn.timer_deadline {
+                    let deadline = (deadline - endpoint.timer_epoch).as_millis() as u64; // TODO: Bounds check
                     match conn.timer_handle {
-                        Some(ref key) => endpoint.timers.reset_at(key, deadline),
+                        Some(key) => {
+                            endpoint.timers.reset(key, deadline);
+                        }
                         None => {
-                            conn.timer_handle =
-                                Some(endpoint.timers.insert_at(conn_handle, deadline));
+                            conn.timer_handle = Some(endpoint.timers.insert(deadline, conn_handle));
                         }
                     }
-                    // endpoint.timers may need to be polled
+                    // base timer may need to be updated
                     keep_going = true;
                 }
             }
@@ -406,6 +425,7 @@ impl Drop for EndpointDriver {
 
 #[derive(Debug)]
 pub(crate) struct EndpointInner {
+    runtime: Arc<dyn Runtime>,
     socket: Box<dyn AsyncUdpSocket>,
     udp_state: UdpState,
     inner: proto::Endpoint,
@@ -425,6 +445,8 @@ pub(crate) struct EndpointInner {
     dirty: mpsc::UnboundedReceiver<ConnectionHandle>,
     dirty_send: mpsc::UnboundedSender<ConnectionHandle>,
     timers: DelayQueue<ConnectionHandle>,
+    timer_epoch: Instant,
+    base_timer: Option<Pin<Box<dyn AsyncTimer>>>,
 }
 
 impl EndpointInner {
@@ -627,7 +649,12 @@ impl Drop for Incoming {
 pub(crate) struct EndpointRef(Arc<Mutex<EndpointInner>>);
 
 impl EndpointRef {
-    pub(crate) fn new(socket: Box<dyn AsyncUdpSocket>, inner: proto::Endpoint, ipv6: bool) -> Self {
+    pub(crate) fn new(
+        runtime: Arc<dyn Runtime>,
+        socket: Box<dyn AsyncUdpSocket>,
+        inner: proto::Endpoint,
+        ipv6: bool,
+    ) -> Self {
         let udp_state = UdpState::new();
         let recv_buf = vec![
             0;
@@ -637,6 +664,7 @@ impl EndpointRef {
         ];
         let (dirty_send, dirty) = mpsc::unbounded_channel();
         Self(Arc::new(Mutex::new(EndpointInner {
+            runtime,
             socket,
             udp_state,
             inner,
@@ -658,6 +686,8 @@ impl EndpointRef {
             dirty,
             dirty_send,
             timers: DelayQueue::new(),
+            timer_epoch: Instant::now(),
+            base_timer: None,
         })))
     }
 }
