@@ -56,6 +56,7 @@ macro_rules! ready {
 }
 
 mod connection;
+mod delay_queue;
 mod endpoint;
 mod mutex;
 mod notify;
@@ -86,28 +87,6 @@ pub use crate::send_stream::{SendStream, StoppedError, WriteError};
 
 #[cfg(test)]
 mod tests;
-
-#[derive(Debug)]
-enum ConnectionEvent {
-    Close {
-        error_code: VarInt,
-        reason: bytes::Bytes,
-    },
-    Proto(proto::ConnectionEvent),
-    Ping,
-}
-
-#[derive(Debug)]
-enum EndpointEvent {
-    Proto(proto::EndpointEvent),
-    Transmit(proto::Transmit),
-}
-
-/// Maximum number of datagrams processed in send/recv calls to make before moving on to other processing
-///
-/// This helps ensure we don't starve anything when the CPU is slower than the link.
-/// Value is selected by picking a low number which didn't degrade throughput in benchmarks.
-const IO_LOOP_BOUND: usize = 160;
 
 /// The maximum amount of time that should be spent in `recvmsg()` calls per endpoint iteration
 ///

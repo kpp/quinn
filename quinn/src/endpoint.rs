@@ -12,7 +12,7 @@ use std::{
     time::Instant,
 };
 
-use crate::runtime::{default_runtime, AsyncUdpSocket, Runtime};
+use crate::runtime::{default_runtime, AsyncTimer, AsyncUdpSocket, Runtime};
 use bytes::{Bytes, BytesMut};
 use proto::{
     self as proto, ClientConfig, ConnectError, ConnectionHandle, DatagramEvent, ServerConfig,
@@ -22,8 +22,11 @@ use tokio::sync::{mpsc, Notify};
 use udp::{RecvMeta, UdpState, BATCH_SIZE};
 
 use crate::{
-    connection::Connecting, poll_fn, work_limiter::WorkLimiter, ConnectionEvent, EndpointConfig,
-    EndpointEvent, VarInt, IO_LOOP_BOUND, RECV_TIME_BOUND, SEND_TIME_BOUND,
+    connection::{Connecting, ConnectionRef},
+    delay_queue::DelayQueue,
+    poll_fn,
+    work_limiter::WorkLimiter,
+    EndpointConfig, VarInt, RECV_TIME_BOUND, SEND_TIME_BOUND,
 };
 
 /// A QUIC endpoint.
@@ -36,7 +39,7 @@ use crate::{
 pub struct Endpoint {
     pub(crate) inner: EndpointRef,
     pub(crate) default_client_config: Option<ClientConfig>,
-    runtime: Arc<Box<dyn Runtime>>,
+    runtime: Arc<dyn Runtime>,
 }
 
 impl Endpoint {
@@ -91,7 +94,7 @@ impl Endpoint {
         runtime: impl Runtime,
     ) -> io::Result<(Self, Incoming)> {
         let socket = runtime.wrap_udp_socket(socket)?;
-        Self::new_with_runtime(config, server_config, socket, Box::new(runtime))
+        Self::new_with_runtime(config, server_config, socket, Arc::new(runtime))
     }
 
     /// Construct an endpoint with arbitrary configuration and pre-constructed abstract socket
@@ -104,22 +107,21 @@ impl Endpoint {
         socket: impl AsyncUdpSocket,
         runtime: impl Runtime,
     ) -> io::Result<(Self, Incoming)> {
-        Self::new_with_runtime(config, server_config, Box::new(socket), Box::new(runtime))
+        Self::new_with_runtime(config, server_config, Box::new(socket), Arc::new(runtime))
     }
 
     fn new_with_runtime(
         config: EndpointConfig,
         server_config: Option<ServerConfig>,
         socket: Box<dyn AsyncUdpSocket>,
-        runtime: Box<dyn Runtime>,
+        runtime: Arc<dyn Runtime>,
     ) -> io::Result<(Self, Incoming)> {
-        let runtime = Arc::new(runtime);
         let addr = socket.local_addr()?;
         let rc = EndpointRef::new(
+            runtime.clone(),
             socket,
             proto::Endpoint::new(Arc::new(config), server_config.map(Arc::new)),
             addr.is_ipv6(),
-            runtime.clone(),
         );
         let driver = EndpointDriver(rc.clone());
         runtime.spawn(Box::pin(async {
@@ -183,10 +185,9 @@ impl Endpoint {
             addr
         };
         let (ch, conn) = endpoint.inner.connect(config, addr, server_name)?;
-        let udp_state = endpoint.udp_state.clone();
-        Ok(endpoint
-            .connections
-            .insert(ch, conn, udp_state, self.runtime.clone()))
+        let dirty = endpoint.dirty_send.clone();
+        dirty.send(ch).unwrap();
+        Ok(endpoint.connections.insert(dirty, ch, conn))
     }
 
     /// Switch to a new UDP socket
@@ -203,9 +204,10 @@ impl Endpoint {
         inner.ipv6 = addr.is_ipv6();
 
         // Generate some activity so peers notice the rebind
-        for sender in inner.connections.senders.values() {
-            // Ignoring errors from dropped connections
-            let _ = sender.send(ConnectionEvent::Ping);
+        for conn in inner.connections.connections.values() {
+            let mut conn = conn.lock("ping");
+            conn.inner.ping();
+            conn.wake();
         }
 
         Ok(())
@@ -236,12 +238,9 @@ impl Endpoint {
         let reason = Bytes::copy_from_slice(reason);
         let mut endpoint = self.inner.lock().unwrap();
         endpoint.connections.close = Some((error_code, reason.clone()));
-        for sender in endpoint.connections.senders.values() {
-            // Ignoring errors from dropped connections
-            let _ = sender.send(ConnectionEvent::Close {
-                error_code,
-                reason: reason.clone(),
-            });
+        for conn in endpoint.connections.connections.values() {
+            let mut conn = conn.lock("close");
+            conn.close(error_code, reason.clone());
         }
         if let Some(task) = endpoint.incoming_reader.take() {
             task.wake();
@@ -300,15 +299,98 @@ impl Future for EndpointDriver {
 
     #[allow(unused_mut)] // MSRV
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        let mut endpoint = self.0.lock().unwrap();
+        let mut endpoint = &mut *self.0.lock().unwrap();
         if endpoint.driver.is_none() {
             endpoint.driver = Some(cx.waker().clone());
         }
 
-        let now = Instant::now();
-        let mut keep_going = false;
-        keep_going |= endpoint.drive_recv(cx, now)?;
-        keep_going |= endpoint.handle_events(cx);
+        let mut keep_going = endpoint.drive_recv(cx, Instant::now())?;
+
+        while let Some(conn_handle) = endpoint
+            .timers
+            .poll((Instant::now() - endpoint.timer_epoch).as_millis() as u64)
+        {
+            let conn = match endpoint.connections.connections.get(&conn_handle) {
+                Some(c) => c,
+                None => continue,
+            };
+            let mut conn = &mut *conn.lock("poll timeouts");
+            let _guard = conn.span.clone().entered();
+            conn.inner.handle_timeout(Instant::now());
+            conn.timer_handle = None;
+            conn.timer_deadline = None;
+            conn.wake();
+        }
+        if let Some(deadline) = endpoint.timers.next_timeout() {
+            let deadline = endpoint.timer_epoch + std::time::Duration::from_millis(deadline);
+            let timer = match endpoint.base_timer {
+                Some(ref mut x) => {
+                    x.as_mut().reset(deadline);
+                    x
+                }
+                None => endpoint
+                    .base_timer
+                    .insert(endpoint.runtime.new_timer(deadline)),
+            };
+            if let Poll::Ready(()) = timer.as_mut().poll(cx) {
+                keep_going = true;
+            }
+        }
+
+        let mut dirty = Vec::new();
+        while let Poll::Ready(Some(conn_handle)) = endpoint.dirty.poll_recv(cx) {
+            dirty.push(conn_handle);
+        }
+
+        let max_datagrams = endpoint.udp_state.max_gso_segments();
+        let mut drained = Vec::new();
+        for conn_handle in dirty {
+            let conn = match endpoint.connections.connections.get(&conn_handle) {
+                Some(c) => c,
+                None => continue,
+            };
+            let mut conn = conn.lock("poll dirty");
+            conn.is_dirty = false;
+            let _guard = conn.span.clone().entered();
+            let mut keep_conn_going = conn.drive_transmit(max_datagrams, &mut endpoint.outgoing);
+            if let Some(deadline) = conn.inner.poll_timeout() {
+                if Some(deadline) != conn.timer_deadline {
+                    let deadline = (deadline - endpoint.timer_epoch).as_millis() as u64; // TODO: Bounds check
+                    match conn.timer_handle {
+                        Some(key) => {
+                            endpoint.timers.reset(key, deadline);
+                        }
+                        None => {
+                            conn.timer_handle = Some(endpoint.timers.insert(deadline, conn_handle));
+                        }
+                    }
+                    // base timer may need to be updated
+                    keep_going = true;
+                }
+            }
+            while let Some(event) = conn.inner.poll_endpoint_events() {
+                if event.is_drained() {
+                    drained.push(conn_handle);
+                }
+                if let Some(event) = endpoint.inner.handle_event(conn_handle, event) {
+                    conn.inner.handle_event(event);
+                    keep_conn_going = true;
+                }
+            }
+            conn.forward_app_events();
+            if keep_conn_going {
+                conn.wake();
+                keep_going = true;
+            }
+        }
+
+        for conn_handle in drained {
+            endpoint.connections.connections.remove(&conn_handle);
+        }
+        if endpoint.connections.is_empty() {
+            endpoint.idle.notify_waiters();
+        }
+
         keep_going |= endpoint.drive_send(cx)?;
 
         if !endpoint.incoming.is_empty() {
@@ -320,7 +402,6 @@ impl Future for EndpointDriver {
         if endpoint.ref_count == 0 && endpoint.connections.is_empty() {
             Poll::Ready(Ok(()))
         } else {
-            drop(endpoint);
             // If there is more work to do schedule the endpoint task again.
             // `wake_by_ref()` is called outside the lock to minimize
             // lock contention on a multithreaded runtime.
@@ -339,16 +420,14 @@ impl Drop for EndpointDriver {
         if let Some(task) = endpoint.incoming_reader.take() {
             task.wake();
         }
-        // Drop all outgoing channels, signaling the termination of the endpoint to the associated
-        // connections.
-        endpoint.connections.senders.clear();
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct EndpointInner {
+    runtime: Arc<dyn Runtime>,
     socket: Box<dyn AsyncUdpSocket>,
-    udp_state: Arc<UdpState>,
+    udp_state: UdpState,
     inner: proto::Endpoint,
     outgoing: VecDeque<proto::Transmit>,
     incoming: VecDeque<Connecting>,
@@ -356,7 +435,6 @@ pub(crate) struct EndpointInner {
     driver: Option<Waker>,
     ipv6: bool,
     connections: ConnectionSet,
-    events: mpsc::UnboundedReceiver<(ConnectionHandle, EndpointEvent)>,
     /// Number of live handles that can be used to initiate or handle I/O; excludes the driver
     ref_count: usize,
     driver_lost: bool,
@@ -364,7 +442,11 @@ pub(crate) struct EndpointInner {
     recv_buf: Box<[u8]>,
     send_limiter: WorkLimiter,
     idle: Arc<Notify>,
-    runtime: Arc<Box<dyn Runtime>>,
+    dirty: mpsc::UnboundedReceiver<ConnectionHandle>,
+    dirty_send: mpsc::UnboundedSender<ConnectionHandle>,
+    timers: DelayQueue<ConnectionHandle>,
+    timer_epoch: Instant,
+    base_timer: Option<Pin<Box<dyn AsyncTimer>>>,
 }
 
 impl EndpointInner {
@@ -396,21 +478,18 @@ impl EndpointInner {
                             {
                                 Some((handle, DatagramEvent::NewConnection(conn))) => {
                                     let conn = self.connections.insert(
+                                        self.dirty_send.clone(),
                                         handle,
                                         conn,
-                                        self.udp_state.clone(),
-                                        self.runtime.clone(),
                                     );
                                     self.incoming.push_back(conn);
+                                    self.dirty_send.send(handle).unwrap();
                                 }
                                 Some((handle, DatagramEvent::ConnectionEvent(event))) => {
-                                    // Ignoring errors from dropped connections that haven't yet been cleaned up
-                                    let _ = self
-                                        .connections
-                                        .senders
-                                        .get_mut(&handle)
-                                        .unwrap()
-                                        .send(ConnectionEvent::Proto(event));
+                                    let conn = self.connections.connections.get(&handle).unwrap();
+                                    let mut conn = conn.lock("handle_event");
+                                    conn.inner.handle_event(event);
+                                    conn.wake();
                                 }
                                 None => {}
                             }
@@ -480,49 +559,11 @@ impl EndpointInner {
         self.send_limiter.finish_cycle();
         result
     }
-
-    fn handle_events(&mut self, cx: &mut Context) -> bool {
-        use EndpointEvent::*;
-
-        for _ in 0..IO_LOOP_BOUND {
-            match self.events.poll_recv(cx) {
-                Poll::Ready(Some((ch, event))) => match event {
-                    Proto(e) => {
-                        if e.is_drained() {
-                            self.connections.senders.remove(&ch);
-                            if self.connections.is_empty() {
-                                self.idle.notify_waiters();
-                            }
-                        }
-                        if let Some(event) = self.inner.handle_event(ch, e) {
-                            // Ignoring errors from dropped connections that haven't yet been cleaned up
-                            let _ = self
-                                .connections
-                                .senders
-                                .get_mut(&ch)
-                                .unwrap()
-                                .send(ConnectionEvent::Proto(event));
-                        }
-                    }
-                    Transmit(t) => self.outgoing.push_back(t),
-                },
-                Poll::Ready(None) => unreachable!("EndpointInner owns one sender"),
-                Poll::Pending => {
-                    return false;
-                }
-            }
-        }
-
-        true
-    }
 }
 
 #[derive(Debug)]
 struct ConnectionSet {
-    /// Senders for communicating with the endpoint's connections
-    senders: FxHashMap<ConnectionHandle, mpsc::UnboundedSender<ConnectionEvent>>,
-    /// Stored to give out clones to new ConnectionInners
-    sender: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
+    connections: FxHashMap<ConnectionHandle, ConnectionRef>,
     /// Set if the endpoint has been manually closed
     close: Option<(VarInt, Bytes)>,
 }
@@ -530,25 +571,21 @@ struct ConnectionSet {
 impl ConnectionSet {
     fn insert(
         &mut self,
+        dirty: mpsc::UnboundedSender<ConnectionHandle>,
         handle: ConnectionHandle,
         conn: proto::Connection,
-        udp_state: Arc<UdpState>,
-        runtime: Arc<Box<dyn Runtime>>,
     ) -> Connecting {
-        let (send, recv) = mpsc::unbounded_channel();
+        let (future, conn) = Connecting::new(dirty, handle, conn);
         if let Some((error_code, ref reason)) = self.close {
-            send.send(ConnectionEvent::Close {
-                error_code,
-                reason: reason.clone(),
-            })
-            .unwrap();
+            let mut conn = conn.lock("close");
+            conn.close(error_code, reason.clone());
         }
-        self.senders.insert(handle, send);
-        Connecting::new(handle, conn, self.sender.clone(), recv, udp_state, runtime)
+        self.connections.insert(handle, conn);
+        future
     }
 
     fn is_empty(&self) -> bool {
-        self.senders.is_empty()
+        self.connections.is_empty()
     }
 }
 
@@ -613,32 +650,31 @@ pub(crate) struct EndpointRef(Arc<Mutex<EndpointInner>>);
 
 impl EndpointRef {
     pub(crate) fn new(
+        runtime: Arc<dyn Runtime>,
         socket: Box<dyn AsyncUdpSocket>,
         inner: proto::Endpoint,
         ipv6: bool,
-        runtime: Arc<Box<dyn Runtime>>,
     ) -> Self {
-        let udp_state = Arc::new(UdpState::new());
+        let udp_state = UdpState::new();
         let recv_buf = vec![
             0;
             inner.config().get_max_udp_payload_size().min(64 * 1024) as usize
                 * udp_state.gro_segments()
                 * BATCH_SIZE
         ];
-        let (sender, events) = mpsc::unbounded_channel();
+        let (dirty_send, dirty) = mpsc::unbounded_channel();
         Self(Arc::new(Mutex::new(EndpointInner {
+            runtime,
             socket,
             udp_state,
             inner,
             ipv6,
-            events,
             outgoing: VecDeque::new(),
             incoming: VecDeque::new(),
             incoming_reader: None,
             driver: None,
             connections: ConnectionSet {
-                senders: FxHashMap::default(),
-                sender,
+                connections: FxHashMap::default(),
                 close: None,
             },
             ref_count: 0,
@@ -647,7 +683,11 @@ impl EndpointRef {
             recv_limiter: WorkLimiter::new(RECV_TIME_BOUND),
             send_limiter: WorkLimiter::new(SEND_TIME_BOUND),
             idle: Arc::new(Notify::new()),
-            runtime,
+            dirty,
+            dirty_send,
+            timers: DelayQueue::new(),
+            timer_epoch: Instant::now(),
+            base_timer: None,
         })))
     }
 }
